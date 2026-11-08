@@ -1,0 +1,23 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local database files (including a bind-mounted PostgreSQL data directory)
+pgdata/
+*.log
+
+# Editor and operating-system files
+.idea/
+.DS_Store
+Thumbs.db

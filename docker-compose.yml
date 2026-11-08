@@ -1,0 +1,16 @@
+services:
+  db:
+    build: ./docker
+    container_name: chem-pg
+    environment:
+      POSTGRES_USER: chem
+      POSTGRES_PASSWORD: chem_dev_pw
+      POSTGRES_DB: chemdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 1g
+
+volumes:
+  pgdata:
