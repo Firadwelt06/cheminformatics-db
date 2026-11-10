@@ -1,0 +1,8 @@
+# powershell postgres clean rebuild
+
+docker compose down -v
+docker compose up -d --build
+docker exec chem-pg pg_isready -U chem -d chemdb
+docker exec chem-pg psql -U chem -d chemdb -v ON_ERROR_STOP=1 -f /sql/01_schema.sql
+docker exec chem-pg psql -U chem -d chemdb -v ON_ERROR_STOP=1 -f /sql/02_stage_bbbp.sql
+docker exec chem-pg psql -U chem -d chemdb -v ON_ERROR_STOP=1 -f /sql/02_load_bbbp.sql
