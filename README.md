@@ -39,31 +39,7 @@ This is a first-run flow against an empty database volume. The schema script is 
 
 ## Architecture
 
-```mermaid
-erDiagram
-    molecules ||--o{ dataset_records : "referenced by"
-
-    molecules {
-        bigint mol_id PK
-        text canonical_smiles UK
-        mol mol
-    }
-    dataset_records {
-        text dataset PK
-        integer row_idx PK
-        bigint mol_id FK
-        text raw_smiles
-        smallint label
-    }
-    ingest_rejects {
-        text dataset PK
-        integer row_idx PK
-        text raw_smiles
-        smallint label
-        text reject_reason
-        timestamptz rejected_at
-    }
-```
+![Schema diagram: molecules contains distinct structures, dataset_records contains source annotations, and ingest_rejects records rejected input rows.](docs/schema-diagram.png)
 
 `molecules` stores one parsed structure per canonical SMILES, while `dataset_records` stores each dataset row and its source-specific annotations; this avoids storing the expensive structure repeatedly when records refer to the same molecule. `ingest_rejects` keeps invalid or empty structures with their source row and reason, rather than silently dropping them.
 
@@ -113,6 +89,7 @@ docker compose exec -T db psql -U chem -d chemdb -c "SELECT version(); SELECT rd
 - `sql/` — schema, staging, and BBBP load scripts.
 - `data/` — checked-in benchmark dataset.
 - `docs/` — project journal, roadmap, and decision notes.
+- [Publishing kit](docs/publishing-kit.md) — article, carousel, Shorts, and visual assets.
 
 ## License
 
