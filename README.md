@@ -70,6 +70,28 @@ To confirm the runtime version after startup:
 docker compose exec -T db psql -U chem -d chemdb -c "SELECT version(); SELECT rdkit_version();"
 ```
 
+## Data validation
+
+Validation happens in two layers.
+
+Schema constraints: NOT NULL on SMILES and labels, UNIQUE canonical SMILES
+per molecule, a foreign key from records to molecules, and composite primary
+keys that make loads re-runnable.
+
+Loader checks (sql/03_load_bbbp.sql):
+- A SMILES that fails RDKit parsing or sanitization is quarantined in
+  ingest_rejects as parse_failed.
+- A SMILES that parses to a molecule with zero atoms is quarantined as
+  empty_molecule.
+- Duplicate structures are collapsed by canonical SMILES; every source record
+  is preserved.
+- The load aborts and rolls back if staged rows do not equal loaded plus
+  rejected rows.
+
+Not validated (yet): label values, salts/charge/stereo standardization, and
+label conflicts. Conflicts are reported, not resolved: 10 molecules in BBBP
+carry conflicting labels.
+
 ## Limitations
 
 - The current dataset has only about 2,000 rows.
