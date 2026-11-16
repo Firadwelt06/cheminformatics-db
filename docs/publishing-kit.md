@@ -50,6 +50,6 @@ Suggested titles:
 
 ## Schema diagram: how to read it
 
-`molecules` stores the parsed structure once per canonical SMILES. Each `dataset_records` row retains the dataset, original row number, original SMILES, and label, and points to one molecule through `mol_id`; multiple source rows can therefore refer to one molecule. `ingest_rejects` retains failed or zero-atom input rows and their reason; it has no foreign-key relationship to `molecules` because rejected input may have no valid structure to reference.
+`molecules` stores the parsed structure once per canonical SMILES. The current schema also has a `datasets` registry referenced by both `dataset_records` and `ingest_rejects`; the PNG below predates that registry.
 
-The diagram mirrors the current SQL: composite primary keys are shown on `dataset_records` and `ingest_rejects`, `canonical_smiles` is unique, and the only relationship line is the actual `dataset_records.mol_id` foreign key. It deliberately does not imply a dataset registry or a molecule foreign key for rejects.
+The PNG shows composite primary keys on `dataset_records` and `ingest_rejects`, `canonical_smiles` as unique, and the `dataset_records.mol_id` foreign key. It does not show the current dataset foreign keys; refer to `sql/01_schema.sql` for the authoritative schema.

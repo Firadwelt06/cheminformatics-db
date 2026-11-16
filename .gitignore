@@ -16,6 +16,7 @@ __pycache__/
 # Local database files (including a bind-mounted PostgreSQL data directory)
 pgdata/
 *.log
+/data/bbbp.csv
 
 # Editor and operating-system files
 .idea/

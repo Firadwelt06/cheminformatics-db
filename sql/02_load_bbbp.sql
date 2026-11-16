@@ -1,7 +1,39 @@
 \set ON_ERROR_STOP on
 
+\if :{?file_sha256}
+\else
+\echo 'Required psql variable: -v file_sha256=<64-character lowercase SHA-256>'
+\quit 3
+\endif
+
+\if :{?source_url}
+\else
+\set source_url 'https://huggingface.co/datasets/scikit-fingerprints/MoleculeNet_BBBP/resolve/86db3f465c006b230b1e5af9032a1e05be4db618/bbbp.csv'
+\endif
+
+\if :{?dataset_version}
+\else
+\set dataset_version 'scikit-fingerprints/MoleculeNet_BBBP@86db3f465c006b230b1e5af9032a1e05be4db618'
+\endif
+
 BEGIN;
 SET LOCAL client_min_messages = error;
+
+INSERT INTO datasets (dataset, source_url, citation, license, version, file_sha256, loaded_at)
+VALUES (
+    'bbbp',
+    NULLIF(:'source_url', ''),
+    'Martins et al. (2012); Wu et al. (2018)',
+    'unknown',
+    :'dataset_version',
+    :'file_sha256',
+    now()
+)
+ON CONFLICT (dataset) DO UPDATE
+SET source_url = coalesce(EXCLUDED.source_url, datasets.source_url),
+    version = EXCLUDED.version,
+    file_sha256 = EXCLUDED.file_sha256,
+    loaded_at = EXCLUDED.loaded_at;
 
 CREATE TEMP TABLE bbbp_parsed ON COMMIT DROP AS
 SELECT row_idx, smiles, label, mol,

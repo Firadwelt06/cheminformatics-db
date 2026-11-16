@@ -13,35 +13,45 @@ These are early measurements on one machine and a 2,039-row dataset. See the [fi
 
 ## Quickstart
 
-Requirements: Docker Desktop with the WSL2 backend and Docker Compose v2. From the repository root, start the database:
+Requirements: Windows, Docker Desktop with the WSL2 backend, Docker Compose v2, and PowerShell 7 or later. A local `.env` file is optional; copy `.env.example` to `.env` and adjust the development-only credentials if desired. Docker Compose reads `.env` automatically.
+
+The BBBP CSV is not distributed by this repository because its upstream license is marked unknown. On a fresh checkout, download the [pinned 2,039-row Hugging Face artifact](https://huggingface.co/datasets/scikit-fingerprints/MoleculeNet_BBBP/tree/86db3f465c006b230b1e5af9032a1e05be4db618):
+
+```powershell
+.\scripts\Download-BBBP.ps1
+```
+
+The downloader verifies the pinned file checksum, its `SMILES,label` columns, and the 2,039-row count; it refuses to overwrite an existing local file unless `-Force` is supplied. This pinned artifact's row values and ordering match the local baseline. The loader records its URL, revision, citations, unknown license, and the downloaded file's checksum in `datasets`.
+
+The one-command clean rebuild is:
+
+```powershell
+.\scripts\Verify-Rebuild.ps1
+```
+
+It rebuilds the image and database from scratch, waits for PostgreSQL, executes the three SQL files with `ON_ERROR_STOP`, and verifies `2039|2039|0|1975` (staged, loaded, rejected, distinct molecules). It deletes the Compose named volumes via `docker compose down -v`; use `-WhatIf` to preview or `-Confirm:$false` to suppress the confirmation prompt.
+
+To run the SQL manually against a fresh database instead, start Compose and run:
 
 ```powershell
 docker compose up --build -d
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U chem -d chemdb -f /sql/01_schema.sql
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U chem -d chemdb -f /sql/02_stage_bbbp.sql
+$hash = (Get-FileHash .\data\bbbp.csv -Algorithm SHA256).Hash.ToLowerInvariant()
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -v "file_sha256=$hash" -U chem -d chemdb -f /sql/02_load_bbbp.sql
 ```
 
-In the same terminal, run the schema, stage the CSV, and load it:
-
-```powershell
-docker compose exec -T db psql -U chem -d chemdb -f /sql/01_schema.sql
-docker compose exec -T db psql -U chem -d chemdb -f /sql/02_stage_bbbp.sql
-docker compose exec -T db psql -U chem -d chemdb -f /sql/02_load_bbbp.sql
-```
-
-The final command prints the reconciliation counts:
-
-```text
- staged | loaded | rejected | distinct_molecules
---------+--------+----------+-------------------
-   2039 |   2039 |        0 |              1975
-```
-
-This is a first-run flow against an empty database volume. The schema script is not a reset/migration script; re-running it against an already initialized volume will fail because the tables already exist. The named `pgdata` volume preserves your database when the container is recreated. Do not remove it unless you intend to discard the database.
+Manual commands above show the default credentials; use matching values from `.env` if you customized them. The schema is a first-run script, not a migration. The named `pgdata` volume preserves the database when the container is recreated; do not run `docker compose down -v` unless you intend to discard it.
 
 ## Architecture
 
-![Schema diagram: molecules contains distinct structures, dataset_records contains source annotations, and ingest_rejects records rejected input rows.](docs/schema-diagram.png)
+![Earlier schema diagram showing molecules, dataset records, and rejected input rows.](docs/schema-diagram.png)
 
-`molecules` stores one parsed structure per canonical SMILES, while `dataset_records` stores each dataset row and its source-specific annotations; this avoids storing the expensive structure repeatedly when records refer to the same molecule. `ingest_rejects` keeps invalid or empty structures with their source row and reason, rather than silently dropping them.
+`molecules` stores one parsed structure per canonical SMILES, while `dataset_records` stores each source row and its annotations. The `datasets` registry records source URL, citation, license, version, checksum, and load time; foreign keys prevent records or rejects from referring to a misspelled dataset. `ingest_rejects` retains invalid or empty structures with their source row and reason.
+
+The `v_molecule_identity` view computes molecular formula and average molecular weight on demand rather than widening every molecule row. InChIKey is not stored; check whether the installed cartridge provides an InChI function before adding an on-demand projection. The `v_molecule_fingerprints` view exposes Morgan bit fingerprints for similarity queries. Quality views include `v_label_balance`, `v_duplicate_groups`, `v_label_conflicts`, and `v_load_summary`.
+
+Runnable examples are in [`sql/queries/`](sql/queries/): the benzene substructure count and a top-10 Tanimoto similarity ranking for an aspirin query. The similarity example computes Morgan fingerprints on demand and is intended as a correctness/example query, not an indexed large-scale search. Run them with `psql -f` after the database is loaded.
 
 ## Findings and caveats
 
@@ -50,7 +60,7 @@ This is a first-run flow against an empty database volume. The schema script is 
 | Parsing SMILES per row costs about 0.30–0.35 ms/row; querying a stored `mol` costs about 0.06 ms/row (roughly 5–6× faster). | A small-dataset, single-machine microbenchmark; timings vary by query, hardware, and run. |
 | A stored `mol` value uses about 357 B versus 52 B for the SMILES value (~6.9× more storage). | Per-value measurements, not total table/index size; PostgreSQL row and index overhead are additional. |
 | The `@>` substructure operator uses PostgreSQL's generic `contsel` selectivity estimator: the plan estimates 0.1% of rows (`rows=2`) where 1,367 match. The cartridge functions are also priced at `procost = 1`. | The estimate and function cost are for the observed plan and installed extension; they are not a guarantee about every predicate or query. |
-| The checked-in BBBP CSV has 2,039 data rows, with 0 unparseable or empty-molecule rejects in the load. It produces 1,975 distinct molecules. | The original MoleculeNet paper's Table 1 reports 2,053 BBBP compounds, not 2,050. The paper's benchmark count and this repository's CSV are not the same version/count; record the exact source artifact when comparing results. ([Wu et al., 2018, Table 1](https://pmc.ncbi.nlm.nih.gov/articles/PMC5868307/)) |
+| The 2,039-row BBBP artifact used for the baseline produced 0 unparseable or empty-molecule rejects and 1,975 distinct molecules. | The original MoleculeNet paper's Table 1 reports 2,053 BBBP compounds, not 2,050. The paper's benchmark count and this normalized artifact are not the same version/count; record the exact source artifact when comparing results. ([Wu et al., 2018, Table 1](https://pmc.ncbi.nlm.nih.gov/articles/PMC5868307/)) |
 | There are 64 duplicate records across 60 molecule groups; 10 groups contain conflicting labels. | Duplicate groups are based on the canonicalized molecule identity, not byte-identical input SMILES. |
 | About 76.5% of labels are positive. ROC-AUC is the MoleculeNet-recommended metric for BBBP; accuracy alone can be misleading with this class imbalance. | Keep the split strategy fixed and report class counts; a metric alone does not address leakage or split bias. |
 | RDKit parses an empty SMILES string as a valid zero-atom molecule. | A `mol IS NOT NULL` check alone would admit it. The loader also checks atom count and records empty structures in `ingest_rejects`. |
@@ -62,7 +72,7 @@ This is a first-run flow against an empty database volume. The schema script is 
 - **RDKit:** the PostgreSQL RDKit cartridge is installed from Debian's `postgresql-15-rdkit` package in [docker/Dockerfile](docker/Dockerfile). The runtime `rdkit_version()` output observed for this setup is `0.73.0`; retain that literal output in benchmark notes rather than assuming it is the upstream RDKit release number. The package is not version-pinned in the Dockerfile, so a future image build may install a different package revision.
 - **Persistent database storage:** Compose uses a named `pgdata` volume for `/var/lib/postgresql/data`. Keeping PostgreSQL's data directory in a Docker-managed volume avoids binding the live database files to a Windows/WSL workspace path and lets the database survive container replacement.
 - **Shared memory:** `shm_size: 1g` enlarges the container's `/dev/shm` beyond Docker's small default. PostgreSQL uses shared memory for database operations; the larger allocation avoids an unnecessarily tight container limit as query and worker needs grow.
-- **Dataset artifact:** the checked-in [`data/bbbp.csv`](data/bbbp.csv) contains 2,039 data rows (excluding its header). The primary MoleculeNet paper reports 2,053 BBBP compounds; do not describe the checked-in file as the paper's exact 2,050-row dataset without identifying and reconciling the source version.
+- **Dataset artifact:** `scripts/Download-BBBP.ps1` fetches the pinned `scikit-fingerprints/MoleculeNet_BBBP` CSV revision. Its 2,039 rows are not the same count as the 2,053 compounds reported in the primary MoleculeNet paper; record the exact artifact and checksum when comparing results. The dataset card marks its license unknown, so the CSV is ignored by Git.
 
 To confirm the runtime version after startup:
 
@@ -78,7 +88,7 @@ Schema constraints: NOT NULL on SMILES and labels, UNIQUE canonical SMILES
 per molecule, a foreign key from records to molecules, and composite primary
 keys that make loads re-runnable.
 
-Loader checks (sql/03_load_bbbp.sql):
+Loader checks ([sql/02_load_bbbp.sql](sql/02_load_bbbp.sql)):
 - A SMILES that fails RDKit parsing or sanitization is quarantined in
   ingest_rejects as parse_failed.
 - A SMILES that parses to a molecule with zero atoms is quarantined as
@@ -91,6 +101,7 @@ Loader checks (sql/03_load_bbbp.sql):
 Not validated (yet): label values, salts/charge/stereo standardization, and
 label conflicts. Conflicts are reported, not resolved: 10 molecules in BBBP
 carry conflicting labels.
+Check which identity and fingerprint functions are available in the installed cartridge with `\df *mol*`, `\df *inchi*`, `\df *fp*`, and `\df *tanimoto*`. In the observed environment, `\dx` reported extension version `4.3.0` and `rdkit_version()` returned `0.73.0`; those values are recorded as observed runtime output, not inferred upstream release versions.
 
 ## Limitations
 
@@ -109,7 +120,8 @@ carry conflicting labels.
 
 - `docker/` — PostgreSQL image setup.
 - `sql/` — schema, staging, and BBBP load scripts.
-- `data/` — checked-in benchmark dataset.
+- `data/` — local, Git-ignored BBBP dataset artifact.
+- `scripts/` — dataset download and destructive clean-rebuild verification workflows.
 - `docs/` — project journal, roadmap, and decision notes.
 - [Publishing kit](docs/publishing-kit.md) — article, carousel, Shorts, and visual assets.
 

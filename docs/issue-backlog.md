@@ -16,10 +16,13 @@ This is the initial backlog for the repository. Keep it in sync with GitHub issu
 
 ## Ready for execution
 
-- Build the schema for molecules and source datasets
 - Document how invalid SMILES are tracked and rejected
 - Add a smoke-test ingestion script
 - Add a dockerized local verification workflow
+
+## Completed
+
+- Build the schema for molecules and source datasets (#10)
 
 ## In progress
 
