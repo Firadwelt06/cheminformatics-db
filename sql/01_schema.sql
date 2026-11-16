@@ -44,7 +44,7 @@ CREATE TABLE ingest_rejects (
 CREATE VIEW v_molecule_identity AS
 SELECT mol_id,
        canonical_smiles,
-       mol_formula(mol) AS molecular_formula,
+       mol_formula(mol)::text AS molecular_formula,
        mol_amw(mol)     AS molecular_weight
 FROM molecules;
 
