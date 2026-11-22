@@ -41,6 +41,47 @@ $hash = (Get-FileHash .\data\bbbp.csv -Algorithm SHA256).Hash.ToLowerInvariant()
 docker compose exec -T db psql -v ON_ERROR_STOP=1 -v "file_sha256=$hash" -U chem -d chemdb -f /sql/02_load_bbbp.sql
 ```
 
+To set up the optional benchmark query catalog after loading BBBP, run:
+
+```powershell
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U chem -d chemdb -f /sql/03_bench_schema.sql
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U chem -d chemdb -f /sql/04_seed_query_catalog.sql
+```
+
+The rare-element query uses boron (`[B]`): the pinned BBBP dataset has one boron-containing molecule and no selenium (`[Se]`).
+
+## Running the baseline benchmark
+
+After loading BBBP and setting up the benchmark schema and query catalog above,
+install the Python dependency and run the benchmark from the repository root:
+
+```powershell
+py -m pip install -r requirements.txt
+py .\scripts\run_benchmark.py --label baseline_seqscan
+```
+
+By default, the runner connects to the local Compose database with the development
+credentials. Set `DATABASE_URL` or pass `--dsn` if your connection settings differ.
+It first verifies that BBBP contains exactly 1,975 distinct loaded molecules;
+otherwise it stops without recording a run. For each catalog query it performs
+three warm-ups followed by 20 timed `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` runs.
+Only timed iterations are saved. The `baseline_seqscan` label disables index and
+bitmap scans for the transaction; other labels leave those planner settings
+unchanged. The runner prints the new `run_id` and the p50, p95, and match counts.
+
+To reproduce the summary for a particular run, substitute the printed ID:
+
+```sql
+SELECT query_id,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY exec_ms) AS p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY exec_ms) AS p95,
+       max(actual_rows) AS matches
+FROM bench.run_results
+WHERE run_id = 1
+GROUP BY query_id
+ORDER BY query_id;
+```
+
 Manual commands above show the default credentials; use matching values from `.env` if you customized them. The schema is a first-run script, not a migration. The named `pgdata` volume preserves the database when the container is recreated; do not run `docker compose down -v` unless you intend to discard it.
 
 ## Architecture
