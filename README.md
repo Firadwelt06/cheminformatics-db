@@ -65,15 +65,19 @@ py .\scripts\run_benchmark.py --label baseline_seqscan
 By default, the runner connects to the local Compose database with the development
 credentials. Set `DATABASE_URL` or pass `--dsn` if your connection settings differ.
 It first verifies that BBBP contains exactly 1,975 distinct loaded molecules;
-otherwise it stops without recording a run. Each query gets three warm-ups and
-one timed pilot, followed by an adaptive number of timed
+otherwise it stops without recording a run. By default, it runs the `gist`
+variant alone; pass `--variants` to interleave paired `seq` and `gist` plans
+inside every iteration in randomized order. Each query gets three warm-ups per
+variant and one timed pilot pair, followed by an adaptive number of timed
 `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` runs. The default budget is about 30
 seconds per query, capped at 100 runs; a 30-second `statement_timeout` bounds
 each statement. Override these with `--target-query-seconds`,
 `--max-iterations`, and `--statement-timeout-ms`. Timed rows include scan/index
-names, planning time, row estimates and buffer counts. The `baseline_seqscan`
-label disables index and bitmap scans. The summary reports min, p50, IQR,
-matches and maximum shared reads; expect small iteration counts for slow queries.
+names, planning time, row estimates and buffer counts. The descriptive `--label`
+does not control planner settings. The `seq` variant disables index and bitmap
+scans; `gist` enables both and lets the planner choose. With `--variants`, the
+runner reports per-variant min, p50, IQR and matches, and the median of
+per-iteration `seq / gist` execution-time ratios.
 
 ### Pre-index baseline and predictions
 
@@ -81,7 +85,8 @@ Before creating a GiST index, run 37 passed the 1,975-molecule assertion. All
 six plans were `Seq Scan`, had no `Gather`, estimated 2 rows, and recorded 0
 shared reads. Actual matches were Q1=1, Q2=57, Q3=1,367, Q4=201, Q5=1,974,
 and Q6=0. The molecule without carbon is `mol_id=1709`, canonical SMILES
-`[N-]=[N+]=O`. Q4's `[OH]` SMARTS explicitly constrains the hydroxyl
+`[N-]=[N+]=O`, which is nitrous oxide. Its BBBP record is row 2033 with label
+1 (BBBP-positive). Q4's `[OH]` SMARTS explicitly constrains the hydroxyl
 hydrogen, so query complexity as well as selectivity can affect matcher cost.
 
 The repeat baseline p50s differed substantially between runs 36 and 37
@@ -96,6 +101,94 @@ because the index will still return many candidates to recheck (Q5 matches
 1,974 of 1,975). Q5 is the strongest test of whether a low row estimate leads
 the planner to choose a poor index plan.
 
+### Day 2: GiST index results
+
+The index was created **after** loading BBBP using
+`CREATE INDEX CONCURRENTLY molecules_mol_gist ON molecules USING gist (mol);`.
+On PostgreSQL 15.20 with RDKit extension 4.3.0 / `rdkit_version()` 0.73.0,
+building it took 7.156 seconds wall-clock from PowerShell (including `docker
+compose exec` startup) and occupied 860,160 bytes (840 kB). The table had 1,975
+distinct BBBP molecules. Check the index size with:
+
+```sql
+SELECT pg_relation_size('molecules_mol_gist') AS size_bytes,
+       pg_size_pretty(pg_relation_size('molecules_mol_gist')) AS size_pretty;
+```
+
+To capture all six catalog queries with timing collection disabled:
+
+```powershell
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U chem -d chemdb -f /sql/05_explain_indexed_queries.sql
+```
+
+For paired benchmarks use one run, not two sequential calls:
+
+```powershell
+py .\scripts\run_benchmark.py --variants --label day2_paired --target-query-seconds 1 --max-iterations 10
+```
+
+Run 40 is the validation run of the interleaved implementation. It passed the
+1,975-row assertion and randomized `seq` / `gist` order within each iteration.
+The median ratio is computed from paired per-iteration `seq_ms / gist_ms`
+values, not by dividing variant medians. The brief adaptive budget produced
+fewer pairs for slower queries, so Q5/Q6 ratios are preliminary.
+
+| Query | Paired iterations | Median seq / gist ratio |
+|---|---:|---:|
+| Q1 | 10 | 37.17x |
+| Q2 | 10 | 16.88x |
+| Q3 | 7 | 1.19x |
+| Q4 | 6 | 1.22x |
+| Q5 | 2 | 0.56x |
+| Q6 | 4 | 0.87x |
+
+The original runs 38 and 39 used separate invocations, so their ratio-of-medians
+table below is historical and not an interleaved paired measurement. For
+Each iteration stores one row per variant. The result-table primary key is
+`(run_id, query_id, iteration, variant)`, and historical rows were migrated to
+`seq` or `gist` based on their run label. For the ratio output, values above 1
+mean the sequential scan took longer than the GiST-enabled plan.
+
+| Query | Existing prediction (unchanged) | Actual plan and separate-run p50 comparison (historical) |
+|---|---|---|
+| Q1 | GiST chosen; among the largest improvements. | Bitmap Heap Scan using `molecules_mol_gist`; 27.68x faster. |
+| Q2 | GiST chosen; improves. | Bitmap Heap Scan using `molecules_mol_gist`; 24.00x faster. |
+| Q3 | GiST chosen; may get slower. | Bitmap Heap Scan using `molecules_mol_gist`; 1.10x faster in this pair (small change; noise remains relevant). |
+| Q4 | GiST chosen; improves. | Bitmap Heap Scan using `molecules_mol_gist`; 1.49x faster. |
+| Q5 | GiST chosen; may get slower, especially. | Bitmap Heap Scan using `molecules_mol_gist`; 1.11x faster in this pair, but reads more shared buffers than the sequential scan. |
+| Q6 | GiST chosen; among the largest improvements. | Bitmap Heap Scan using `molecules_mol_gist`; 1.27x faster, but 1,400 false-positive candidates were rechecked. |
+
+| Query | Run 38 baseline p50 (ms) | Run 39 GiST p50 (ms) | Ratio of p50s (not paired) | Matches |
+|---|---:|---:|---:|---:|
+| Q1 | 68.3465 | 2.4695 | 27.68x | 1 |
+| Q2 | 70.8260 | 2.9510 | 24.00x | 57 |
+| Q3 | 77.1645 | 70.0805 | 1.10x | 1,367 |
+| Q4 | 76.7535 | 51.6275 | 1.49x | 201 |
+| Q5 | 69.8945 | 63.2225 | 1.11x | 1,974 |
+| Q6 | 67.3545 | 53.0105 | 1.27x | 0 |
+
+All six indexed plans were `Bitmap Index Scan` → `Bitmap Heap Scan`, with a
+`Recheck Cond`; the planner estimated 2 rows for every SMARTS. Q5's 1,974
+actual matches are **987x** its estimate (1,974 / 2). For Q6, the index did not
+produce zero candidates: the Bitmap Index Scan returned 1,400 candidates, all
+removed by the heap recheck (`Rows Removed by Index Recheck: 1400`). Thus this
+zero-match SMARTS is not a no-recheck best case for this GiST signature index.
+The paired runs show a small Q3 improvement rather than a slowdown, but it is
+only about 9%, so timing noise and the small dataset limit that conclusion.
+
+| Query | Plan rows | Bitmap index candidates | Actual rows | Rows removed by recheck |
+|---|---:|---:|---:|---:|
+| Q1 | 2 | 31 | 1 | 30 |
+| Q2 | 2 | 84 | 57 | 27 |
+| Q3 | 2 | 1,810 | 1,367 | 443 |
+| Q4 | 2 | 1,285 | 201 | 1,084 |
+| Q5 | 2 | 1,974 | 1,974 | 0 |
+| Q6 | 2 | 1,400 | 0 | 1,400 |
+
+The `mol_id=1709` label and indexed plan demonstrate why assumptions based on
+molecule size or SMARTS selectivity should be verified against the actual data
+and access method.
+
 To reproduce the summary for a particular run, substitute the printed ID:
 
 ```sql
@@ -109,9 +202,9 @@ SELECT query_id,
        max(planning_ms) AS planning_ms,
        max(shared_read) AS max_shared_read
 FROM bench.run_results
-WHERE run_id = 37
-GROUP BY query_id
-ORDER BY query_id;
+WHERE run_id = 40
+GROUP BY query_id, variant
+ORDER BY query_id, variant;
 ```
 
 Manual commands above show the default credentials; use matching values from `.env` if you customized them. The schema is a first-run script, not a migration. The named `pgdata` volume preserves the database when the container is recreated; do not run `docker compose down -v` unless you intend to discard it.

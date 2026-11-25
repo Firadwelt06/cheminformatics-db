@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import statistics
 import subprocess
 from pathlib import Path
@@ -17,9 +18,10 @@ from psycopg.types.json import Jsonb
 EXPECTED_MOLECULES = 1975
 WARMUP_RUNS = 3
 PILOT_RUNS = 1
+VARIANTS = {"seq": ("off", "off"), "gist": ("on", "on")}
 DEFAULT_DSN = "postgresql://chem:chem_dev_pw@localhost:5432/chemdb"
 SUMMARY_SQL = """
-    SELECT query_id,
+    SELECT query_id, variant,
            count(*) AS iterations,
            min(exec_ms) AS min_ms,
            percentile_cont(0.5) WITHIN GROUP (ORDER BY exec_ms) AS p50,
@@ -31,6 +33,28 @@ SUMMARY_SQL = """
            max(shared_read) AS max_shared_read
     FROM bench.run_results
     WHERE run_id = %s
+    GROUP BY query_id, variant
+    ORDER BY query_id, variant
+"""
+RATIO_SQL = """
+    WITH paired AS (
+        SELECT query_id, iteration,
+               max(exec_ms) FILTER (WHERE variant = 'seq') AS seq_ms,
+               max(exec_ms) FILTER (WHERE variant = 'gist') AS gist_ms
+        FROM bench.run_results
+        WHERE run_id = %s
+          AND variant IN ('seq', 'gist')
+        GROUP BY query_id, iteration
+        HAVING count(*) FILTER (WHERE variant = 'seq') = 1
+           AND count(*) FILTER (WHERE variant = 'gist') = 1
+    )
+    SELECT query_id,
+           count(*) AS paired_iterations,
+       percentile_cont(0.5) WITHIN GROUP (
+           ORDER BY seq_ms / NULLIF(gist_ms, 0)
+       )
+         AS median_seq_over_gist_ratio
+    FROM paired
     GROUP BY query_id
     ORDER BY query_id
 """
@@ -67,16 +91,6 @@ def explain(cursor: psycopg.Cursor[Any], smarts: str) -> dict[str, Any]:
     return result[0]
 
 
-def buffer_totals(plan: dict[str, Any]) -> tuple[int, int]:
-    hits = plan.get("Shared Hit Blocks", 0)
-    reads = plan.get("Shared Read Blocks", 0)
-    for child in plan.get("Plans", []):
-        child_hits, child_reads = buffer_totals(child)
-        hits += child_hits
-        reads += child_reads
-    return hits, reads
-
-
 def plan_access(plan: dict[str, Any]) -> tuple[str | None, str | None]:
     scan_types = {
         "Bitmap Heap Scan",
@@ -100,12 +114,28 @@ def plan_access(plan: dict[str, Any]) -> tuple[str | None, str | None]:
     return scan_type, ", ".join(sorted(index_names)) or None
 
 
+def set_variant(cursor: psycopg.Cursor[Any], variant: str) -> None:
+    indexscan, bitmapscan = VARIANTS[variant]
+    cursor.execute(
+        """
+        SELECT set_config('enable_indexscan', %s, false),
+               set_config('enable_bitmapscan', %s, false)
+        """,
+        (indexscan, bitmapscan),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--label",
-        default="baseline_seqscan",
-        help="label recorded for this benchmark run (default: baseline_seqscan)",
+        default="benchmark",
+        help="descriptive label recorded for this benchmark run (default: benchmark)",
+    )
+    parser.add_argument(
+        "--variants",
+        action="store_true",
+        help="interleave sequential-scan and planner-free GiST variants per iteration",
     )
     parser.add_argument(
         "--dsn",
@@ -154,11 +184,6 @@ def main() -> None:
                 "SELECT set_config('statement_timeout', %s, false)",
                 (f"{args.statement_timeout_ms}ms",),
             )
-            if args.label == "baseline_seqscan":
-                cursor.execute("SET enable_seqscan = on")
-                cursor.execute("SET enable_indexscan = off")
-                cursor.execute("SET enable_bitmapscan = off")
-
             cursor.execute(
                 """
                 SELECT current_setting('server_version'),
@@ -188,6 +213,8 @@ def main() -> None:
                 "statement_timeout": statement_timeout,
                 "target_query_seconds": args.target_query_seconds,
                 "max_iterations": args.max_iterations,
+                "variants": list(VARIANTS) if args.variants else ["gist"],
+                "paired_variants": args.variants,
             }
 
             queries = cursor.execute(
@@ -212,79 +239,98 @@ def main() -> None:
                 (args.label, git_revision(), pg_version, row_count, Jsonb(settings)),
             ).fetchone()[0]
 
+            variants = list(VARIANTS) if args.variants else ["gist"]
             for query_id, smarts in queries:
                 for _ in range(WARMUP_RUNS):
-                    try:
-                        explain(cursor, smarts)
-                    except psycopg.errors.QueryCanceled as error:
-                        raise RuntimeError(
-                            f"{query_id} exceeded the {statement_timeout} statement "
-                            f"timeout during warm-up; partial results are retained "
-                            f"in run {run_id}."
-                        ) from error
+                    for variant in random.sample(variants, k=len(variants)):
+                        set_variant(cursor, variant)
+                        try:
+                            explain(cursor, smarts)
+                        except psycopg.errors.QueryCanceled as error:
+                            raise RuntimeError(
+                                f"{query_id}/{variant} exceeded the "
+                                f"{statement_timeout} statement timeout during "
+                                f"warm-up; partial results are retained in run "
+                                f"{run_id}."
+                            ) from error
 
-                durations = []
+                durations = {variant: [] for variant in variants}
                 iteration = 1
                 target_ms = args.target_query_seconds * 1000
                 max_iterations = args.max_iterations
                 while iteration <= max_iterations:
-                    try:
-                        document = explain(cursor, smarts)
-                    except psycopg.errors.QueryCanceled as error:
-                        raise RuntimeError(
-                            f"{query_id} exceeded the {statement_timeout} statement "
-                            f"timeout; partial results are retained in run {run_id}."
-                        ) from error
-                    plan = document["Plan"]
-                    shared_hit, shared_read = buffer_totals(plan)
-                    scan_type, index_name = plan_access(plan)
-                    cursor.execute(
-                        """
-                        INSERT INTO bench.run_results
-                            (run_id, query_id, iteration, exec_ms, plan_rows,
-                             actual_rows, shared_hit, shared_read, scan_type,
-                             index_name, planning_ms, plan_json)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            run_id,
-                            query_id,
-                            iteration,
-                            document["Execution Time"],
-                            plan["Plan Rows"],
-                            plan["Actual Rows"],
-                            shared_hit,
-                            shared_read,
-                            scan_type,
-                            index_name,
-                            document["Planning Time"],
-                            Jsonb(document) if iteration == 1 else None,
-                        ),
-                    )
-                    durations.append(document["Execution Time"])
+                    for variant in random.sample(variants, k=len(variants)):
+                        set_variant(cursor, variant)
+                        try:
+                            document = explain(cursor, smarts)
+                        except psycopg.errors.QueryCanceled as error:
+                            raise RuntimeError(
+                                f"{query_id}/{variant} exceeded the "
+                                f"{statement_timeout} statement timeout; partial "
+                                f"results are retained in run {run_id}."
+                            ) from error
+                        plan = document["Plan"]
+                        shared_hit = plan.get("Shared Hit Blocks", 0)
+                        shared_read = plan.get("Shared Read Blocks", 0)
+                        scan_type, index_name = plan_access(plan)
+                        cursor.execute(
+                            """
+                            INSERT INTO bench.run_results
+                                (run_id, query_id, iteration, variant, exec_ms,
+                                 plan_rows, actual_rows, shared_hit, shared_read,
+                                 scan_type, index_name, planning_ms, plan_json)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s)
+                            """,
+                            (
+                                run_id,
+                                query_id,
+                                iteration,
+                                variant,
+                                document["Execution Time"],
+                                plan["Plan Rows"],
+                                plan["Actual Rows"],
+                                shared_hit,
+                                shared_read,
+                                scan_type,
+                                index_name,
+                                document["Planning Time"],
+                                Jsonb(document) if iteration == 1 else None,
+                            ),
+                        )
+                        durations[variant].append(document["Execution Time"])
 
                     if iteration == PILOT_RUNS:
-                        median_ms = max(statistics.median(durations), 1)
+                        median_ms = max(
+                            sum(statistics.median(samples) for samples in durations.values()),
+                            1,
+                        )
                         target_iterations = int(target_ms / median_ms)
                         max_iterations = max(
                             PILOT_RUNS,
                             min(args.max_iterations, target_iterations),
                         )
                         print(
-                            f"{query_id}: {max_iterations} timed iterations "
-                            f"(pilot median {median_ms:.3f} ms)"
+                            f"{query_id}: {max_iterations} timed iteration(s) "
+                            f"per variant (pilot pair median {median_ms:.3f} ms)"
                         )
                     iteration += 1
 
             summary = cursor.execute(SUMMARY_SQL, (run_id,)).fetchall()
+            paired = (
+                cursor.execute(RATIO_SQL, (run_id,)).fetchall()
+                if args.variants
+                else []
+            )
 
     print(f"run_id={run_id}")
     print(
-        "query_id\titerations\tmin_ms\tp50_ms\tiqr_ms\tmatches"
+        "query_id\tvariant\titerations\tmin_ms\tp50_ms\tiqr_ms\tmatches"
         "\tscan_type\tindex_name\tmax_shared_read"
     )
     for (
         query_id,
+        variant,
         iterations,
         min_ms,
         p50,
@@ -295,9 +341,13 @@ def main() -> None:
         max_shared_read,
     ) in summary:
         print(
-            f"{query_id}\t{iterations}\t{min_ms}\t{p50}\t{iqr}\t{matches}"
+            f"{query_id}\t{variant}\t{iterations}\t{min_ms}\t{p50}\t{iqr}\t{matches}"
             f"\t{scan_type}\t{index_name or '-'}\t{max_shared_read}"
         )
+    if args.variants:
+        print("query_id\tpaired_iterations\tmedian_seq_over_gist_ratio")
+        for query_id, paired_iterations, ratio in paired:
+            print(f"{query_id}\t{paired_iterations}\t{ratio}")
 
 
 if __name__ == "__main__":

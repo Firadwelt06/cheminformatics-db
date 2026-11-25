@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS bench.run_results (
     run_id       bigint REFERENCES bench.runs,
     query_id     text   REFERENCES bench.query_catalog,
     iteration    int    NOT NULL,
+    variant      text   NOT NULL,
     exec_ms      numeric NOT NULL,
     plan_rows    bigint,                 -- planner's estimate
     actual_rows  bigint,
@@ -54,8 +55,40 @@ CREATE TABLE IF NOT EXISTS bench.run_results (
     index_name   text,
     planning_ms  numeric,
     plan_json    jsonb,                  -- keep for iteration 1 only
-    PRIMARY KEY (run_id, query_id, iteration)
+    PRIMARY KEY (run_id, query_id, iteration, variant)
 );
+
+ALTER TABLE bench.run_results
+    ADD COLUMN IF NOT EXISTS variant text;
+UPDATE bench.run_results AS result
+SET variant = CASE
+    WHEN run.label = 'baseline_seqscan' THEN 'seq'
+    WHEN run.label = 'gist_mol' THEN 'gist'
+    ELSE 'legacy'
+END
+FROM bench.runs AS run
+WHERE result.run_id = run.run_id
+  AND result.variant IS NULL;
+ALTER TABLE bench.run_results
+    ALTER COLUMN variant SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'bench.run_results'::regclass
+          AND contype = 'p'
+          AND pg_get_constraintdef(oid) =
+              'PRIMARY KEY (run_id, query_id, iteration, variant)'
+    ) THEN
+        ALTER TABLE bench.run_results
+            DROP CONSTRAINT IF EXISTS run_results_pkey;
+        ALTER TABLE bench.run_results
+            ADD CONSTRAINT run_results_pkey
+            PRIMARY KEY (run_id, query_id, iteration, variant);
+    END IF;
+END $$;
 
 ALTER TABLE bench.run_results
     ADD COLUMN IF NOT EXISTS scan_type text;
