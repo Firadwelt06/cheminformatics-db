@@ -1,32 +1,37 @@
 \set ON_ERROR_STOP on
 
-INSERT INTO bench.query_catalog (query_id, description, sql_text)
+INSERT INTO bench.query_catalog (query_id, description, smarts)
 VALUES
     (
         'Q1',
-        'Rare boron atom; selenium matched no BBBP rows.',
-        'SELECT mol_id FROM molecules WHERE mol @> ''[B]''::qmol;'
+        'Rare boron atom; one BBBP match.',
+        '[B]'
     ),
     (
         'Q2',
         'Moderately rare sulfonamide.',
-        'SELECT mol_id FROM molecules WHERE mol @> ''S(=O)(=O)N''::qmol;'
+        'S(=O)(=O)N'
     ),
     (
         'Q3',
         'Common benzene ring.',
-        'SELECT mol_id FROM molecules WHERE mol @> ''c1ccccc1''::qmol;'
+        'c1ccccc1'
     ),
     (
         'Q4',
         'Common carboxylic acid.',
-        'SELECT mol_id FROM molecules WHERE mol @> ''C(=O)[OH]''::qmol;'
+        'C(=O)[OH]'
     ),
     (
         'Q5',
         'Carbon atom; matches essentially every molecule.',
-        'SELECT mol_id FROM molecules WHERE mol @> ''[#6]''::qmol;'
+        '[#6]'
+    ),
+    (
+        'Q6',
+        'Selenium atom; no BBBP molecules match.',
+        '[Se]'
     )
 ON CONFLICT (query_id) DO UPDATE
 SET description = EXCLUDED.description,
-    sql_text = EXCLUDED.sql_text;
+    smarts = EXCLUDED.smarts;

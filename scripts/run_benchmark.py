@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import re
+import statistics
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,13 +16,19 @@ from psycopg.types.json import Jsonb
 
 EXPECTED_MOLECULES = 1975
 WARMUP_RUNS = 3
-TIMED_RUNS = 20
+PILOT_RUNS = 1
 DEFAULT_DSN = "postgresql://chem:chem_dev_pw@localhost:5432/chemdb"
 SUMMARY_SQL = """
     SELECT query_id,
+           count(*) AS iterations,
+           min(exec_ms) AS min_ms,
            percentile_cont(0.5) WITHIN GROUP (ORDER BY exec_ms) AS p50,
-           percentile_cont(0.95) WITHIN GROUP (ORDER BY exec_ms) AS p95,
-           max(actual_rows) AS matches
+           percentile_cont(0.75) WITHIN GROUP (ORDER BY exec_ms)
+             - percentile_cont(0.25) WITHIN GROUP (ORDER BY exec_ms) AS iqr_ms,
+           max(actual_rows) AS matches,
+           mode() WITHIN GROUP (ORDER BY scan_type) AS scan_type,
+           string_agg(DISTINCT index_name, ', ') FILTER (WHERE index_name IS NOT NULL) AS index_name,
+           max(shared_read) AS max_shared_read
     FROM bench.run_results
     WHERE run_id = %s
     GROUP BY query_id
@@ -50,18 +55,15 @@ def git_revision() -> str:
     return f"{revision}-dirty" if changes.strip() else revision
 
 
-def explain(cursor: psycopg.Cursor[Any], query: str) -> dict[str, Any]:
-    if not re.match(r"^\s*SELECT\b", query, re.IGNORECASE):
-        raise ValueError(f"Catalog query must be a SELECT statement: {query!r}")
-
-    statement = query.strip().removesuffix(";")
-    if ";" in statement:
-        raise ValueError(f"Catalog query must contain one statement: {query!r}")
-
-    cursor.execute(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {statement}")
+def explain(cursor: psycopg.Cursor[Any], smarts: str) -> dict[str, Any]:
+    cursor.execute(
+        """
+        EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        SELECT mol_id FROM molecules WHERE mol @> %s::qmol
+        """,
+        (smarts,),
+    )
     result = cursor.fetchone()[0]
-    if isinstance(result, str):
-        result = json.loads(result)
     return result[0]
 
 
@@ -73,6 +75,29 @@ def buffer_totals(plan: dict[str, Any]) -> tuple[int, int]:
         hits += child_hits
         reads += child_reads
     return hits, reads
+
+
+def plan_access(plan: dict[str, Any]) -> tuple[str | None, str | None]:
+    scan_types = {
+        "Bitmap Heap Scan",
+        "Foreign Scan",
+        "Index Only Scan",
+        "Index Scan",
+        "Parallel Seq Scan",
+        "Seq Scan",
+        "Tid Scan",
+    }
+    scan_type = None
+    index_names: set[str] = set()
+    nodes = [plan]
+    while nodes:
+        node = nodes.pop(0)
+        if scan_type is None and node.get("Node Type") in scan_types:
+            scan_type = node["Node Type"]
+        if node.get("Index Name"):
+            index_names.add(node["Index Name"])
+        nodes.extend(node.get("Plans", []))
+    return scan_type, ", ".join(sorted(index_names)) or None
 
 
 def main() -> None:
@@ -87,9 +112,29 @@ def main() -> None:
         default=os.environ.get("DATABASE_URL", DEFAULT_DSN),
         help="PostgreSQL connection string (default: DATABASE_URL or local Compose)",
     )
+    parser.add_argument(
+        "--statement-timeout-ms",
+        type=int,
+        default=30000,
+        help="per-query PostgreSQL statement timeout in milliseconds (default: 30000)",
+    )
+    parser.add_argument(
+        "--target-query-seconds",
+        type=float,
+        default=30,
+        help="approximate timed-run budget per query for adaptive iterations (default: 30)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=100,
+        help="maximum timed iterations per query (default: 100)",
+    )
     args = parser.parse_args()
+    if args.statement_timeout_ms <= 0 or args.target_query_seconds <= 0 or args.max_iterations <= 0:
+        parser.error("timeout, target duration, and max iterations must all be positive")
 
-    with psycopg.connect(args.dsn) as connection:
+    with psycopg.connect(args.dsn, autocommit=True) as connection:
         with connection.cursor() as cursor:
             row_count = cursor.execute(
                 """
@@ -105,10 +150,14 @@ def main() -> None:
                     f"found {row_count}; refusing to run benchmark."
                 )
 
+            cursor.execute(
+                "SELECT set_config('statement_timeout', %s, false)",
+                (f"{args.statement_timeout_ms}ms",),
+            )
             if args.label == "baseline_seqscan":
-                cursor.execute("SET LOCAL enable_seqscan = on")
-                cursor.execute("SET LOCAL enable_indexscan = off")
-                cursor.execute("SET LOCAL enable_bitmapscan = off")
+                cursor.execute("SET enable_seqscan = on")
+                cursor.execute("SET enable_indexscan = off")
+                cursor.execute("SET enable_bitmapscan = off")
 
             cursor.execute(
                 """
@@ -117,7 +166,8 @@ def main() -> None:
                        current_setting('shared_buffers'),
                        current_setting('enable_seqscan'),
                        current_setting('enable_indexscan'),
-                       current_setting('enable_bitmapscan')
+                       current_setting('enable_bitmapscan'),
+                       current_setting('statement_timeout')
                 """
             )
             (
@@ -127,6 +177,7 @@ def main() -> None:
                 enable_seqscan,
                 enable_indexscan,
                 enable_bitmapscan,
+                statement_timeout,
             ) = cursor.fetchone()
             settings = {
                 "work_mem": work_mem,
@@ -134,11 +185,14 @@ def main() -> None:
                 "enable_seqscan": enable_seqscan,
                 "enable_indexscan": enable_indexscan,
                 "enable_bitmapscan": enable_bitmapscan,
+                "statement_timeout": statement_timeout,
+                "target_query_seconds": args.target_query_seconds,
+                "max_iterations": args.max_iterations,
             }
 
             queries = cursor.execute(
                 """
-                SELECT query_id, sql_text
+                SELECT query_id, smarts
                 FROM bench.query_catalog
                 ORDER BY query_id
                 """
@@ -158,20 +212,39 @@ def main() -> None:
                 (args.label, git_revision(), pg_version, row_count, Jsonb(settings)),
             ).fetchone()[0]
 
-            for query_id, sql_text in queries:
+            for query_id, smarts in queries:
                 for _ in range(WARMUP_RUNS):
-                    explain(cursor, sql_text)
+                    try:
+                        explain(cursor, smarts)
+                    except psycopg.errors.QueryCanceled as error:
+                        raise RuntimeError(
+                            f"{query_id} exceeded the {statement_timeout} statement "
+                            f"timeout during warm-up; partial results are retained "
+                            f"in run {run_id}."
+                        ) from error
 
-                for iteration in range(1, TIMED_RUNS + 1):
-                    document = explain(cursor, sql_text)
+                durations = []
+                iteration = 1
+                target_ms = args.target_query_seconds * 1000
+                max_iterations = args.max_iterations
+                while iteration <= max_iterations:
+                    try:
+                        document = explain(cursor, smarts)
+                    except psycopg.errors.QueryCanceled as error:
+                        raise RuntimeError(
+                            f"{query_id} exceeded the {statement_timeout} statement "
+                            f"timeout; partial results are retained in run {run_id}."
+                        ) from error
                     plan = document["Plan"]
                     shared_hit, shared_read = buffer_totals(plan)
+                    scan_type, index_name = plan_access(plan)
                     cursor.execute(
                         """
                         INSERT INTO bench.run_results
                             (run_id, query_id, iteration, exec_ms, plan_rows,
-                             actual_rows, shared_hit, shared_read, plan_json)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             actual_rows, shared_hit, shared_read, scan_type,
+                             index_name, planning_ms, plan_json)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             run_id,
@@ -182,19 +255,49 @@ def main() -> None:
                             plan["Actual Rows"],
                             shared_hit,
                             shared_read,
+                            scan_type,
+                            index_name,
+                            document["Planning Time"],
                             Jsonb(document) if iteration == 1 else None,
                         ),
                     )
+                    durations.append(document["Execution Time"])
 
-        connection.commit()
+                    if iteration == PILOT_RUNS:
+                        median_ms = max(statistics.median(durations), 1)
+                        target_iterations = int(target_ms / median_ms)
+                        max_iterations = max(
+                            PILOT_RUNS,
+                            min(args.max_iterations, target_iterations),
+                        )
+                        print(
+                            f"{query_id}: {max_iterations} timed iterations "
+                            f"(pilot median {median_ms:.3f} ms)"
+                        )
+                    iteration += 1
 
-        with connection.cursor() as cursor:
             summary = cursor.execute(SUMMARY_SQL, (run_id,)).fetchall()
 
     print(f"run_id={run_id}")
-    print("query_id\tp50_ms\tp95_ms\tmatches")
-    for query_id, p50, p95, matches in summary:
-        print(f"{query_id}\t{p50}\t{p95}\t{matches}")
+    print(
+        "query_id\titerations\tmin_ms\tp50_ms\tiqr_ms\tmatches"
+        "\tscan_type\tindex_name\tmax_shared_read"
+    )
+    for (
+        query_id,
+        iterations,
+        min_ms,
+        p50,
+        iqr,
+        matches,
+        scan_type,
+        index_name,
+        max_shared_read,
+    ) in summary:
+        print(
+            f"{query_id}\t{iterations}\t{min_ms}\t{p50}\t{iqr}\t{matches}"
+            f"\t{scan_type}\t{index_name or '-'}\t{max_shared_read}"
+        )
 
 
 if __name__ == "__main__":

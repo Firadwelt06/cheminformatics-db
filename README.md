@@ -48,7 +48,9 @@ docker compose exec -T db psql -v ON_ERROR_STOP=1 -U chem -d chemdb -f /sql/03_b
 docker compose exec -T db psql -v ON_ERROR_STOP=1 -U chem -d chemdb -f /sql/04_seed_query_catalog.sql
 ```
 
-The rare-element query uses boron (`[B]`): the pinned BBBP dataset has one boron-containing molecule and no selenium (`[Se]`).
+Q1 uses boron (`[B]`), which matches one BBBP molecule. Q6 retains selenium
+(`[Se]`), which matches zero molecules and records that as the rare-pattern
+case.
 
 ## Running the baseline benchmark
 
@@ -63,21 +65,51 @@ py .\scripts\run_benchmark.py --label baseline_seqscan
 By default, the runner connects to the local Compose database with the development
 credentials. Set `DATABASE_URL` or pass `--dsn` if your connection settings differ.
 It first verifies that BBBP contains exactly 1,975 distinct loaded molecules;
-otherwise it stops without recording a run. For each catalog query it performs
-three warm-ups followed by 20 timed `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` runs.
-Only timed iterations are saved. The `baseline_seqscan` label disables index and
-bitmap scans for the transaction; other labels leave those planner settings
-unchanged. The runner prints the new `run_id` and the p50, p95, and match counts.
+otherwise it stops without recording a run. Each query gets three warm-ups and
+one timed pilot, followed by an adaptive number of timed
+`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` runs. The default budget is about 30
+seconds per query, capped at 100 runs; a 30-second `statement_timeout` bounds
+each statement. Override these with `--target-query-seconds`,
+`--max-iterations`, and `--statement-timeout-ms`. Timed rows include scan/index
+names, planning time, row estimates and buffer counts. The `baseline_seqscan`
+label disables index and bitmap scans. The summary reports min, p50, IQR,
+matches and maximum shared reads; expect small iteration counts for slow queries.
+
+### Pre-index baseline and predictions
+
+Before creating a GiST index, run 37 passed the 1,975-molecule assertion. All
+six plans were `Seq Scan`, had no `Gather`, estimated 2 rows, and recorded 0
+shared reads. Actual matches were Q1=1, Q2=57, Q3=1,367, Q4=201, Q5=1,974,
+and Q6=0. The molecule without carbon is `mol_id=1709`, canonical SMILES
+`[N-]=[N+]=O`. Q4's `[OH]` SMARTS explicitly constrains the hydroxyl
+hydrogen, so query complexity as well as selectivity can affect matcher cost.
+
+The repeat baseline p50s differed substantially between runs 36 and 37
+(29–216% for Q1–Q5), despite 0 shared reads. Treat this as observed timing
+noise; compare later indexed results against repeated baselines, not a single
+latency number.
+
+Predictions to compare after the index is added: the planner will choose a GiST
+path for all six because it estimates 2 rows for every SMARTS. Q1 and Q6 should
+benefit most; Q2 and Q4 should improve; Q3 and especially Q5 may get slower
+because the index will still return many candidates to recheck (Q5 matches
+1,974 of 1,975). Q5 is the strongest test of whether a low row estimate leads
+the planner to choose a poor index plan.
 
 To reproduce the summary for a particular run, substitute the printed ID:
 
 ```sql
 SELECT query_id,
+       min(exec_ms) AS min_ms,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY exec_ms) AS p50,
-       percentile_cont(0.95) WITHIN GROUP (ORDER BY exec_ms) AS p95,
-       max(actual_rows) AS matches
+       percentile_cont(0.75) WITHIN GROUP (ORDER BY exec_ms)
+         - percentile_cont(0.25) WITHIN GROUP (ORDER BY exec_ms) AS iqr_ms,
+       max(actual_rows) AS matches,
+       mode() WITHIN GROUP (ORDER BY scan_type) AS scan_type,
+       max(planning_ms) AS planning_ms,
+       max(shared_read) AS max_shared_read
 FROM bench.run_results
-WHERE run_id = 1
+WHERE run_id = 37
 GROUP BY query_id
 ORDER BY query_id;
 ```
