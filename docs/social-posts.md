@@ -8,7 +8,10 @@
 
 PostgreSQL estimated 2 matching molecules. The real answer was 1,367.
 
-SMILES parsed per row: ~0.30–0.35 ms/row. Stored RDKit `mol`: ~0.06 ms/row.
+On the paired Week 2 run, GiST was 56.22× faster for the rare `[B]` pattern
+and 27.25× for sulfonamide; common patterns were near-neutral or slower.
+Zero-match selenium queries still produced 1,400 candidates, all removed by
+recheck.
 
 That speed costs ~6.9× more storage: 357 B vs 52 B per value.
 
@@ -17,7 +20,7 @@ And 10 duplicate groups had conflicting BBBP labels—even after structure canon
 Chemistry knowledge told me what might be hiding in the data. The query plan showed how badly the planner guessed.
 
 Repo: https://github.com/Firadwelt06/cheminformatics-db  
-Week 2: indexes and 10M rows.
+Week 2: indexed search results. Week 3: the planned 10M-row benchmark.
 
 ## YouTube Shorts scripts
 
@@ -31,7 +34,8 @@ I searched for a benzene ring inside stored molecules using RDKit in PostgreSQL.
 
 This is a small, unindexed, 2,000-row benchmark, not a production claim. But it's a great reminder: always compare estimated rows with actual rows.
 
-Week 2: indexes, parallel workers, and 10 million rows.”
+Week 2 added index experiments; the 10-million-row benchmark is planned for
+Week 3.”
 
 ### Short 2 — A valid string, zero atoms
 

@@ -30,7 +30,7 @@ These are designed graphics using measurements and query results checked against
 2. Upload [linkedin-carousel.pdf](./linkedin-carousel.pdf). It has five portrait 4:5 pages (1080 × 1350 source slides) in the intended order. The individual numbered PNGs are there if you need to revise or re-export a slide.
 3. Use the caption from [social-posts.md](./social-posts.md). Add a short document title such as “When PostgreSQL estimated 2 rows—and 1,367 matched.”
 4. Preview page order and legibility in the LinkedIn composer, then add a concise alt-text/description if the upload flow offers it.
-5. The plan image is the opening visual. The remaining slides explain storage, schema, conflicting labels, and the 10M-row next step.
+5. The plan image is the opening visual. The remaining slides explain storage, schema, conflicting labels, and the planned Week 3 10M-row step.
 
 ## YouTube Shorts setup
 

@@ -31,6 +31,16 @@ VALUES
         'Q6',
         'Selenium atom; no BBBP molecules match.',
         '[Se]'
+    ),
+    (
+        'Q7',
+        'Selenium-carbon bond; tests whether carbon lowers Q6 signature collisions.',
+        '[Se]C'
+    ),
+    (
+        'Q8',
+        'Carbon-selenium-carbon pattern; tests whether a second carbon lowers Q6 signature collisions.',
+        'C[Se]C'
     )
 ON CONFLICT (query_id) DO UPDATE
 SET description = EXCLUDED.description,

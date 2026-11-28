@@ -68,6 +68,6 @@ That distinction matters. Canonicalization helps identify duplicate structures, 
 
 At 10M rows, I would build the appropriate RDKit substructure index, refresh statistics, and rerun the same query set with `EXPLAIN (ANALYZE, BUFFERS)`. I would compare indexed and sequential plans, test parallel workers, and track both recall/correctness and end-to-end latency—not just the best timing. I would also preserve a source/version identifier for every dataset record so chemical normalization and label conflicts remain auditable.
 
-This is a 2K-row baseline, not a production benchmark: one machine, roughly ±10–15% timing noise, and indexes still to come. Week 2 is where the planner gets a more serious workout.
+This post records the pre-index baseline, not a production benchmark. Repeated baseline p50s later differed by 29–216% for Q1–Q5 on this one machine and small dataset, so the project now uses interleaved seq/GiST pairs to reduce separate-run timing confounds. Week 2 added substructure GiST and fingerprint similarity experiments; the 10-million-row workload is planned for Week 3. See the repository README and benchmark journal for the paired results and caveats.
 
 **Reproduce the dataset load and see the project:** [github.com/Firadwelt06/cheminformatics-db](https://github.com/Firadwelt06/cheminformatics-db)

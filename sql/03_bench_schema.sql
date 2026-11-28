@@ -96,3 +96,46 @@ ALTER TABLE bench.run_results
     ADD COLUMN IF NOT EXISTS index_name text;
 ALTER TABLE bench.run_results
     ADD COLUMN IF NOT EXISTS planning_ms numeric;
+
+ALTER TABLE bench.run_results
+    ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'success';
+ALTER TABLE bench.run_results
+    ADD COLUMN IF NOT EXISTS timeout_ms integer;
+ALTER TABLE bench.run_results
+    ADD COLUMN IF NOT EXISTS error_message text;
+ALTER TABLE bench.run_results
+    ADD COLUMN IF NOT EXISTS candidates bigint;
+ALTER TABLE bench.run_results
+    ADD COLUMN IF NOT EXISTS rows_removed_by_recheck bigint;
+ALTER TABLE bench.run_results
+    ADD COLUMN IF NOT EXISTS lossy_heap_blocks bigint;
+ALTER TABLE bench.run_results
+    ALTER COLUMN exec_ms DROP NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'bench.run_results'::regclass
+          AND conname = 'run_results_status_check'
+    ) THEN
+        ALTER TABLE bench.run_results
+            ADD CONSTRAINT run_results_status_check
+            CHECK (status IN ('success', 'timeout'));
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'bench.run_results'::regclass
+          AND conname = 'run_results_outcome_check'
+    ) THEN
+        ALTER TABLE bench.run_results
+            ADD CONSTRAINT run_results_outcome_check
+            CHECK (
+                (status = 'success' AND exec_ms IS NOT NULL AND timeout_ms IS NULL)
+                OR
+                (status = 'timeout' AND exec_ms IS NULL AND timeout_ms IS NOT NULL)
+            );
+    END IF;
+END $$;

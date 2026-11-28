@@ -22,15 +22,22 @@ VARIANTS = {"seq": ("off", "off"), "gist": ("on", "on")}
 DEFAULT_DSN = "postgresql://chem:chem_dev_pw@localhost:5432/chemdb"
 SUMMARY_SQL = """
     SELECT query_id, variant,
-           count(*) AS iterations,
-           min(exec_ms) AS min_ms,
-           percentile_cont(0.5) WITHIN GROUP (ORDER BY exec_ms) AS p50,
+           count(*) FILTER (WHERE status = 'success') AS iterations,
+           count(*) FILTER (WHERE status = 'timeout') AS timeouts,
+           min(exec_ms) FILTER (WHERE status = 'success') AS min_ms,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY exec_ms)
+             FILTER (WHERE status = 'success') AS p50,
            percentile_cont(0.75) WITHIN GROUP (ORDER BY exec_ms)
-             - percentile_cont(0.25) WITHIN GROUP (ORDER BY exec_ms) AS iqr_ms,
+             FILTER (WHERE status = 'success')
+             - percentile_cont(0.25) WITHIN GROUP (ORDER BY exec_ms)
+             FILTER (WHERE status = 'success') AS iqr_ms,
            max(actual_rows) AS matches,
            mode() WITHIN GROUP (ORDER BY scan_type) AS scan_type,
            string_agg(DISTINCT index_name, ', ') FILTER (WHERE index_name IS NOT NULL) AS index_name,
-           max(shared_read) AS max_shared_read
+           max(shared_read) AS max_shared_read,
+           max(candidates) AS max_candidates,
+           max(rows_removed_by_recheck) AS max_rows_removed_by_recheck,
+           max(lossy_heap_blocks) AS max_lossy_heap_blocks
     FROM bench.run_results
     WHERE run_id = %s
     GROUP BY query_id, variant
@@ -39,14 +46,22 @@ SUMMARY_SQL = """
 RATIO_SQL = """
     WITH paired AS (
         SELECT query_id, iteration,
-               max(exec_ms) FILTER (WHERE variant = 'seq') AS seq_ms,
-               max(exec_ms) FILTER (WHERE variant = 'gist') AS gist_ms
+               max(exec_ms) FILTER (
+                   WHERE variant = 'seq' AND status = 'success'
+               ) AS seq_ms,
+               max(exec_ms) FILTER (
+                   WHERE variant = 'gist' AND status = 'success'
+               ) AS gist_ms
         FROM bench.run_results
         WHERE run_id = %s
           AND variant IN ('seq', 'gist')
         GROUP BY query_id, iteration
-        HAVING count(*) FILTER (WHERE variant = 'seq') = 1
-           AND count(*) FILTER (WHERE variant = 'gist') = 1
+        HAVING count(*) FILTER (
+                   WHERE variant = 'seq' AND status = 'success'
+               ) = 1
+           AND count(*) FILTER (
+                   WHERE variant = 'gist' AND status = 'success'
+               ) = 1
     )
     SELECT query_id,
            count(*) AS paired_iterations,
@@ -90,7 +105,9 @@ def explain(cursor: psycopg.Cursor[Any], smarts: str) -> dict[str, Any]:
     return result[0]
 
 
-def plan_access(plan: dict[str, Any]) -> tuple[str | None, str | None]:
+def plan_metrics(
+    plan: dict[str, Any],
+) -> tuple[str | None, str | None, int | None, int | None, int | None]:
     scan_types = {
         "Bitmap Heap Scan",
         "Foreign Scan",
@@ -102,6 +119,11 @@ def plan_access(plan: dict[str, Any]) -> tuple[str | None, str | None]:
     }
     scan_type = None
     index_names: set[str] = set()
+    candidates = 0
+    has_bitmap_index_scan = False
+    rows_removed_by_recheck = 0
+    lossy_heap_blocks = 0
+    has_bitmap_heap_scan = False
     nodes = [plan]
     while nodes:
         node = nodes.pop(0)
@@ -109,8 +131,26 @@ def plan_access(plan: dict[str, Any]) -> tuple[str | None, str | None]:
             scan_type = node["Node Type"]
         if node.get("Index Name"):
             index_names.add(node["Index Name"])
+        if node.get("Node Type") == "Bitmap Index Scan":
+            has_bitmap_index_scan = True
+            candidates += round(
+                node.get("Actual Rows", 0) * node.get("Actual Loops", 1)
+            )
+        if node.get("Node Type") == "Bitmap Heap Scan":
+            has_bitmap_heap_scan = True
+            loops = node.get("Actual Loops", 1)
+            rows_removed_by_recheck += round(
+                node.get("Rows Removed by Index Recheck", 0) * loops
+            )
+            lossy_heap_blocks += node.get("Lossy Heap Blocks", 0)
         nodes.extend(node.get("Plans", []))
-    return scan_type, ", ".join(sorted(index_names)) or None
+    return (
+        scan_type,
+        ", ".join(sorted(index_names)) or None,
+        candidates if has_bitmap_index_scan else None,
+        rows_removed_by_recheck if has_bitmap_heap_scan else None,
+        lossy_heap_blocks if has_bitmap_heap_scan else None,
+    )
 
 
 def set_variant(cursor: psycopg.Cursor[Any], variant: str) -> None:
@@ -122,6 +162,23 @@ def set_variant(cursor: psycopg.Cursor[Any], variant: str) -> None:
         """,
         (indexscan, bitmapscan),
     )
+
+
+def explain_with_timeout(
+    cursor: psycopg.Cursor[Any], smarts: str, timeout_ms: int
+) -> dict[str, Any]:
+    cursor.execute("BEGIN")
+    cursor.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{timeout_ms}ms",),
+    )
+    try:
+        document = explain(cursor, smarts)
+    except psycopg.errors.QueryCanceled:
+        cursor.execute("ROLLBACK")
+        raise
+    cursor.execute("COMMIT")
+    return document
 
 
 def main() -> None:
@@ -180,18 +237,13 @@ def main() -> None:
                 )
 
             cursor.execute(
-                "SELECT set_config('statement_timeout', %s, false)",
-                (f"{args.statement_timeout_ms}ms",),
-            )
-            cursor.execute(
                 """
                 SELECT current_setting('server_version'),
                        current_setting('work_mem'),
                        current_setting('shared_buffers'),
                        current_setting('enable_seqscan'),
                        current_setting('enable_indexscan'),
-                       current_setting('enable_bitmapscan'),
-                       current_setting('statement_timeout')
+                       current_setting('enable_bitmapscan')
                 """
             )
             (
@@ -201,8 +253,8 @@ def main() -> None:
                 enable_seqscan,
                 enable_indexscan,
                 enable_bitmapscan,
-                statement_timeout,
             ) = cursor.fetchone()
+            statement_timeout = f"{args.statement_timeout_ms}ms"
             settings = {
                 "work_mem": work_mem,
                 "shared_buffers": shared_buffers,
@@ -244,14 +296,11 @@ def main() -> None:
                     for variant in random.sample(variants, k=len(variants)):
                         set_variant(cursor, variant)
                         try:
-                            explain(cursor, smarts)
-                        except psycopg.errors.QueryCanceled as error:
-                            raise RuntimeError(
-                                f"{query_id}/{variant} exceeded the "
-                                f"{statement_timeout} statement timeout during "
-                                f"warm-up; partial results are retained in run "
-                                f"{run_id}."
-                            ) from error
+                            explain_with_timeout(
+                                cursor, smarts, args.statement_timeout_ms
+                            )
+                        except psycopg.errors.QueryCanceled:
+                            print(f"{query_id}/{variant}: warm-up timed out")
 
                 durations = {variant: [] for variant in variants}
                 iteration = 1
@@ -261,25 +310,51 @@ def main() -> None:
                     for variant in random.sample(variants, k=len(variants)):
                         set_variant(cursor, variant)
                         try:
-                            document = explain(cursor, smarts)
+                            document = explain_with_timeout(
+                                cursor, smarts, args.statement_timeout_ms
+                            )
                         except psycopg.errors.QueryCanceled as error:
-                            raise RuntimeError(
-                                f"{query_id}/{variant} exceeded the "
-                                f"{statement_timeout} statement timeout; partial "
-                                f"results are retained in run {run_id}."
-                            ) from error
+                            cursor.execute(
+                                """
+                                INSERT INTO bench.run_results
+                                    (run_id, query_id, iteration, variant,
+                                     status, timeout_ms, error_message)
+                                VALUES (%s, %s, %s, %s, 'timeout', %s, %s)
+                                """,
+                                (
+                                    run_id,
+                                    query_id,
+                                    iteration,
+                                    variant,
+                                    args.statement_timeout_ms,
+                                    str(error),
+                                ),
+                            )
+                            print(
+                                f"{query_id}/{variant}: timed out after "
+                                f"{args.statement_timeout_ms} ms"
+                            )
+                            continue
                         plan = document["Plan"]
                         shared_hit = plan.get("Shared Hit Blocks", 0)
                         shared_read = plan.get("Shared Read Blocks", 0)
-                        scan_type, index_name = plan_access(plan)
+                        (
+                            scan_type,
+                            index_name,
+                            candidates,
+                            rows_removed_by_recheck,
+                            lossy_heap_blocks,
+                        ) = plan_metrics(plan)
                         cursor.execute(
                             """
                             INSERT INTO bench.run_results
                                 (run_id, query_id, iteration, variant, exec_ms,
                                  plan_rows, actual_rows, shared_hit, shared_read,
-                                 scan_type, index_name, planning_ms, plan_json)
+                                 scan_type, index_name, planning_ms, plan_json,
+                                 candidates, rows_removed_by_recheck,
+                                 lossy_heap_blocks)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                    %s, %s, %s)
+                                    %s, %s, %s, %s, %s, %s)
                             """,
                             (
                                 run_id,
@@ -295,15 +370,20 @@ def main() -> None:
                                 index_name,
                                 document["Planning Time"],
                                 Jsonb(document) if iteration == 1 else None,
+                                candidates,
+                                rows_removed_by_recheck,
+                                lossy_heap_blocks,
                             ),
                         )
                         durations[variant].append(document["Execution Time"])
 
                     if iteration == PILOT_RUNS:
-                        median_ms = max(
-                            sum(statistics.median(samples) for samples in durations.values()),
-                            1,
-                        )
+                        median_ms = max(sum(
+                            statistics.median(samples)
+                            if samples
+                            else args.statement_timeout_ms
+                            for samples in durations.values()
+                        ), 1)
                         target_iterations = int(target_ms / median_ms)
                         max_iterations = max(
                             PILOT_RUNS,
@@ -324,13 +404,15 @@ def main() -> None:
 
     print(f"run_id={run_id}")
     print(
-        "query_id\tvariant\titerations\tmin_ms\tp50_ms\tiqr_ms\tmatches"
-        "\tscan_type\tindex_name\tmax_shared_read"
+        "query_id\tvariant\titerations\ttimeouts\tmin_ms\tp50_ms\tiqr_ms"
+        "\tmatches\tscan_type\tindex_name\tmax_shared_read\tmax_candidates"
+        "\tmax_rows_removed_by_recheck\tmax_lossy_heap_blocks"
     )
     for (
         query_id,
         variant,
         iterations,
+        timeouts,
         min_ms,
         p50,
         iqr,
@@ -338,10 +420,15 @@ def main() -> None:
         scan_type,
         index_name,
         max_shared_read,
+        max_candidates,
+        max_rows_removed_by_recheck,
+        max_lossy_heap_blocks,
     ) in summary:
         print(
-            f"{query_id}\t{variant}\t{iterations}\t{min_ms}\t{p50}\t{iqr}\t{matches}"
-            f"\t{scan_type}\t{index_name or '-'}\t{max_shared_read}"
+            f"{query_id}\t{variant}\t{iterations}\t{timeouts}\t{min_ms}\t{p50}"
+            f"\t{iqr}\t{matches}\t{scan_type}\t{index_name or '-'}"
+            f"\t{max_shared_read}\t{max_candidates}"
+            f"\t{max_rows_removed_by_recheck}\t{max_lossy_heap_blocks}"
         )
     if args.variants:
         print("query_id\tpaired_iterations\tmedian_seq_over_gist_ratio")
