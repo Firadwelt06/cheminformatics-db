@@ -50,10 +50,9 @@ RATIO_SQL = """
     )
     SELECT query_id,
            count(*) AS paired_iterations,
-       percentile_cont(0.5) WITHIN GROUP (
-           ORDER BY seq_ms / NULLIF(gist_ms, 0)
-       )
-         AS median_seq_over_gist_ratio
+           percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY seq_ms / NULLIF(gist_ms, 0)
+           ) AS median_seq_over_gist_ratio
     FROM paired
     GROUP BY query_id
     ORDER BY query_id

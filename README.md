@@ -59,7 +59,7 @@ install the Python dependency and run the benchmark from the repository root:
 
 ```powershell
 py -m pip install -r requirements.txt
-py .\scripts\run_benchmark.py --label baseline_seqscan
+py .\scripts\run_benchmark.py --variants --label day2_paired
 ```
 
 By default, the runner connects to the local Compose database with the development
@@ -127,11 +127,12 @@ For paired benchmarks use one run, not two sequential calls:
 py .\scripts\run_benchmark.py --variants --label day2_paired --target-query-seconds 1 --max-iterations 10
 ```
 
-Run 40 is the validation run of the interleaved implementation. It passed the
+Run 40 validated the interleaved implementation with a brief adaptive budget.
+Run 41 smoke-tested the final version (one pair per query). Both passed the
 1,975-row assertion and randomized `seq` / `gist` order within each iteration.
 The median ratio is computed from paired per-iteration `seq_ms / gist_ms`
-values, not by dividing variant medians. The brief adaptive budget produced
-fewer pairs for slower queries, so Q5/Q6 ratios are preliminary.
+values, not by dividing variant medians. These short validation runs are not
+reliable performance estimates.
 
 | Query | Paired iterations | Median seq / gist ratio |
 |---|---:|---:|
@@ -142,9 +143,20 @@ fewer pairs for slower queries, so Q5/Q6 ratios are preliminary.
 | Q5 | 2 | 0.56x |
 | Q6 | 4 | 0.87x |
 
+Final code smoke test, run 41 (one paired iteration each):
+
+| Query | Median seq / gist ratio |
+|---|---:|
+| Q1 | 22.83x |
+| Q2 | 19.13x |
+| Q3 | 0.84x |
+| Q4 | 2.78x |
+| Q5 | 0.66x |
+| Q6 | 1.24x |
+
 The original runs 38 and 39 used separate invocations, so their ratio-of-medians
-table below is historical and not an interleaved paired measurement. For
-Each iteration stores one row per variant. The result-table primary key is
+table below is historical and not an interleaved paired measurement. For each
+iteration the runner stores one row per variant. The result-table primary key is
 `(run_id, query_id, iteration, variant)`, and historical rows were migrated to
 `seq` or `gist` based on their run label. For the ratio output, values above 1
 mean the sequential scan took longer than the GiST-enabled plan.
@@ -173,8 +185,9 @@ actual matches are **987x** its estimate (1,974 / 2). For Q6, the index did not
 produce zero candidates: the Bitmap Index Scan returned 1,400 candidates, all
 removed by the heap recheck (`Rows Removed by Index Recheck: 1400`). Thus this
 zero-match SMARTS is not a no-recheck best case for this GiST signature index.
-The paired runs show a small Q3 improvement rather than a slowdown, but it is
-only about 9%, so timing noise and the small dataset limit that conclusion.
+The separate-run comparison showed a small Q3 improvement rather than a
+slowdown, but it was only about 9%, so timing noise and the small dataset limit
+that conclusion.
 
 | Query | Plan rows | Bitmap index candidates | Actual rows | Rows removed by recheck |
 |---|---:|---:|---:|---:|
@@ -193,6 +206,7 @@ To reproduce the summary for a particular run, substitute the printed ID:
 
 ```sql
 SELECT query_id,
+       variant,
        min(exec_ms) AS min_ms,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY exec_ms) AS p50,
        percentile_cont(0.75) WITHIN GROUP (ORDER BY exec_ms)
@@ -205,6 +219,29 @@ FROM bench.run_results
 WHERE run_id = 40
 GROUP BY query_id, variant
 ORDER BY query_id, variant;
+```
+
+To calculate the paired ratios directly for another run, use:
+
+```sql
+WITH paired AS (
+    SELECT query_id, iteration,
+           max(exec_ms) FILTER (WHERE variant = 'seq') AS seq_ms,
+           max(exec_ms) FILTER (WHERE variant = 'gist') AS gist_ms
+    FROM bench.run_results
+    WHERE run_id = 40 AND variant IN ('seq', 'gist')
+    GROUP BY query_id, iteration
+    HAVING count(*) FILTER (WHERE variant = 'seq') = 1
+       AND count(*) FILTER (WHERE variant = 'gist') = 1
+)
+SELECT query_id,
+       count(*) AS paired_iterations,
+       percentile_cont(0.5) WITHIN GROUP (
+           ORDER BY seq_ms / NULLIF(gist_ms, 0)
+       ) AS median_seq_over_gist_ratio
+FROM paired
+GROUP BY query_id
+ORDER BY query_id;
 ```
 
 Manual commands above show the default credentials; use matching values from `.env` if you customized them. The schema is a first-run script, not a migration. The named `pgdata` volume preserves the database when the container is recreated; do not run `docker compose down -v` unless you intend to discard it.
@@ -273,7 +310,7 @@ Check which identity and fingerprint functions are available in the installed ca
 
 - The current dataset has only about 2,000 rows.
 - Measurements come from one machine; expect approximately ±10–15% timing noise.
-- Indexes for substructure search have not been built yet, so these results do not represent indexed search performance.
+- The GiST substructure index was measured only on the small BBBP dataset; the results do not establish performance at larger scale.
 - The current findings are not a scale-out or production workload evaluation.
 
 ## Roadmap
